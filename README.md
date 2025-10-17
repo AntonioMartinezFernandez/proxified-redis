@@ -1,11 +1,11 @@
 # Getting started
 
 ```bash
-# In one terminal
 make run-cluster
 make skaffold
 
-# In another terminal
+# Ctrl+C to stop skaffold when redis is ready
+
 cp $HOME/.kube/config secrets/kubeconfig.yaml
 make run
 ```

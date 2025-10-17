@@ -10,11 +10,7 @@ delete-cluster:
 
 .PHONY: skaffold
 skaffold:
-	skaffold dev  --wait-for-deletions=false  --cleanup=false
-
-.PHONY: build
-build:
-	go build -o bin/proxified-redis-app ./cmd/proxified-redis-app/main.go
+	skaffold dev --wait-for-deletions=false  --cleanup=false
 
 .PHONY: run
 run:
