@@ -1,0 +1,21 @@
+apiVersion: skaffold/v4beta12
+kind: Config
+metadata:
+  name: proxified-redis
+manifests:
+  rawYaml:
+    - redis-server.yaml
+profiles:
+  - name: local
+    activation:
+      - command: dev
+        kubeContext: kind-kind
+    patches:
+      - op: add
+        path: /build/artifacts/-
+        value:
+          image: cloud-provider-kind
+          # need to use custom build command since skaffold docker builder does not support remote context
+          custom:
+            buildCommand: |
+              docker build -t $IMAGE https://github.com/kubernetes-sigs/cloud-provider-kind.git#main
