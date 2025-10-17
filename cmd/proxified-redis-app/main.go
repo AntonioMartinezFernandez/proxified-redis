@@ -111,18 +111,24 @@ func main() {
 
 	fmt.Println("✅ Connected to Redis through port-forward")
 
-	if err := rdb.Set(ctx, "example_key", "hello from k8s", 30*time.Second).Err(); err != nil {
-		panic(err)
+	// Simple Redis operations in loop
+	for {
+		select {
+		case <-ctx.Done():
+			close(stopChan)
+			fmt.Println("⏹ Port-forward closed")
+		default:
+			if err := rdb.Set(ctx, "example_key", "hello from k8s", 5*time.Second).Err(); err != nil {
+				panic(err)
+			}
+
+			val, err := rdb.Get(ctx, "example_key").Result()
+			if err != nil {
+				panic(err)
+			}
+
+			fmt.Printf("example_key: %s\n", val)
+			time.Sleep(8 * time.Second)
+		}
 	}
-
-	val, err := rdb.Get(ctx, "example_key").Result()
-	if err != nil {
-		panic(err)
-	}
-
-	fmt.Printf("example_key: %s\n", val)
-
-	<-ctx.Done()
-	close(stopChan)
-	fmt.Println("⏹ Port-forward closed")
 }
