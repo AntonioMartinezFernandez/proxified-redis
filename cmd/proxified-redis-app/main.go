@@ -3,13 +3,11 @@ package main
 import (
 	"context"
 	"fmt"
-	"io"
-	"net"
-	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
-	"sync"
+	k8sdialer "proxified-redis/pkg/k8s_dialer"
+	"strconv"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -17,192 +15,100 @@ import (
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
-	"k8s.io/client-go/tools/portforward"
-	"k8s.io/client-go/transport/spdy"
 )
 
-// k8sDialer wraps the Kubernetes port-forward into a net.Conn dialer
-type k8sDialer struct {
-	config    *rest.Config
-	clientset *kubernetes.Clientset
-	namespace string
-	podName   string
-	podPort   string
-}
-
-func (d *k8sDialer) Dial(ctx context.Context, network, addr string) (net.Conn, error) {
-	// Create the port-forward request
-	restClient := d.clientset.CoreV1().RESTClient()
-	req := restClient.Post().
-		Resource("pods").
-		Namespace(d.namespace).
-		Name(d.podName).
-		SubResource("portforward")
-
-	transport, upgrader, err := spdy.RoundTripperFor(d.config)
-	if err != nil {
-		return nil, err
-	}
-
-	dialer := spdy.NewDialer(upgrader, &http.Client{Transport: transport}, "POST", req.URL())
-
-	// Use StreamConn to create a direct connection
-	streamConn, _, err := dialer.Dial(portforward.PortForwardProtocolV1Name)
-	if err != nil {
-		return nil, err
-	}
-
-	// Create headers for port forwarding
-	headers := http.Header{}
-	headers.Set("streamType", "error")
-	headers.Set("port", d.podPort)
-	headers.Set("requestID", "0")
-
-	// Negotiate the port forward - create error stream
-	errorStream, err := streamConn.CreateStream(headers)
-	if err != nil {
-		streamConn.Close()
-		return nil, err
-	}
-
-	// Create data stream
-	headers.Set("streamType", "data")
-	dataStream, err := streamConn.CreateStream(headers)
-	if err != nil {
-		streamConn.Close()
-		return nil, err
-	}
-
-	// Wrap the streams as a net.Conn
-	conn := &streamAdapter{
-		dataStream:  dataStream,
-		errorStream: errorStream,
-		streamConn:  streamConn,
-	}
-
-	return conn, nil
-}
-
-// streamAdapter adapts SPDY streams to net.Conn interface
-type streamAdapter struct {
-	dataStream  io.ReadWriteCloser
-	errorStream io.ReadWriteCloser
-	streamConn  io.Closer
-	readMu      sync.Mutex
-	writeMu     sync.Mutex
-}
-
-func (s *streamAdapter) Read(b []byte) (n int, err error) {
-	s.readMu.Lock()
-	defer s.readMu.Unlock()
-	return s.dataStream.Read(b)
-}
-
-func (s *streamAdapter) Write(b []byte) (n int, err error) {
-	s.writeMu.Lock()
-	defer s.writeMu.Unlock()
-	return s.dataStream.Write(b)
-}
-
-func (s *streamAdapter) Close() error {
-	s.dataStream.Close()
-	s.errorStream.Close()
-	return s.streamConn.Close()
-}
-
-func (s *streamAdapter) LocalAddr() net.Addr {
-	return &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0}
-}
-
-func (s *streamAdapter) RemoteAddr() net.Addr {
-	return &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 6379}
-}
-
-func (s *streamAdapter) SetDeadline(t time.Time) error {
-	return nil
-}
-
-func (s *streamAdapter) SetReadDeadline(t time.Time) error {
-	return nil
-}
-
-func (s *streamAdapter) SetWriteDeadline(t time.Time) error {
-	return nil
-}
-
 func main() {
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
-	defer stop()
+	pwd, _ := os.Getwd()
+
+	var (
+		namespace          = "default"
+		podPort            = "6379"
+		redisLabelSelector = "app=redis"
+		counter            = 0
+		kubeConfigPath     = filepath.Join(pwd, "secrets", "kubeconfig.yaml")
+	)
+
+	ctx, ctxCancelFunc := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer ctxCancelFunc()
 
 	// Load kubeconfig
-	pwd, _ := os.Getwd()
-	kubeconfig := filepath.Join(pwd, "secrets", "kubeconfig.yaml")
-	config, err := clientcmd.BuildConfigFromFlags("", kubeconfig)
+	kubeConfig, err := clientcmd.BuildConfigFromFlags("", kubeConfigPath)
 	if err != nil {
-		panic(err)
+		fmt.Println("fatal error: ", err)
+		os.Exit(1)
 	}
 
-	clientset, err := kubernetes.NewForConfig(config)
+	// Create Kubernetes clientset
+	clientset, err := kubernetes.NewForConfig(kubeConfig)
 	if err != nil {
-		panic(err)
+		fmt.Println("fatal error: ", err)
+		os.Exit(1)
 	}
 
-	namespace := "default"
-	remotePort := "6379"
-
-	// Find a pod by label (e.g., app=redis)
-	pods, err := clientset.CoreV1().Pods(namespace).List(ctx, v1.ListOptions{
-		LabelSelector: "app=redis",
+	// Find Redis pod
+	redisPods, err := clientset.CoreV1().Pods(namespace).List(ctx, v1.ListOptions{
+		LabelSelector: redisLabelSelector,
 	})
 	if err != nil {
-		panic(err)
+		fmt.Println("fatal error: ", err)
+		os.Exit(1)
 	}
-	if len(pods.Items) == 0 {
+	if len(redisPods.Items) == 0 {
 		panic("no redis pods found")
 	}
-	podName := pods.Items[0].Name
+	podName := redisPods.Items[0].Name
 
-	// Create custom dialer
-	k8sDialer := &k8sDialer{
-		config:    config,
-		clientset: clientset,
-		namespace: namespace,
-		podName:   podName,
-		podPort:   remotePort,
-	}
+	// Create Redis client with k8s dialer
+	redisClient := NewRedisClient(ctx, kubeConfig, clientset, namespace, podName, podPort)
 
-	// Connect Redis with custom dialer - no local port created!
-	rdb := redis.NewClient(&redis.Options{
-		Addr: "k8s-pod:6379", // Dummy address, won't be used
-		Dialer: func(ctx context.Context, network, addr string) (net.Conn, error) {
-			return k8sDialer.Dial(ctx, network, addr)
-		},
-	})
+	// Execute SET/GET Redis operations in loop
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
 
-	if err := rdb.Ping(ctx).Err(); err != nil {
-		panic(err)
-	}
-
-	fmt.Printf("✅ Connected to Redis directly through K8s pod %s (no local port)\n", podName)
-
-	// Simple Redis operations in loop
 	for {
 		select {
 		case <-ctx.Done():
-			fmt.Println("⏹ Connection closed")
+			fmt.Println("connection closed")
 			return
-		default:
-			if err := rdb.Set(ctx, "example_key", "hello from k8s", 5*time.Second).Err(); err != nil {
-				panic(err)
+
+		case <-ticker.C:
+			if err := redisClient.Set(
+				ctx, "key_"+strconv.Itoa(counter),
+				"Hello Pepito!",
+				10*time.Second,
+			).Err(); err != nil {
+				fmt.Println("fatal error: ", err)
+				os.Exit(1)
 			}
 
-			val, err := rdb.Get(ctx, "example_key").Result()
+			val, err := redisClient.Get(ctx, "key_"+strconv.Itoa(counter)).Result()
 			if err != nil {
-				panic(err)
+				fmt.Println("fatal error: ", err)
+				os.Exit(1)
 			}
 
-			fmt.Printf("example_key: %s\n", val)
-			time.Sleep(8 * time.Second)
+			fmt.Printf("key_%d: %s\n", counter, val)
+			counter++
 		}
 	}
+}
+
+func NewRedisClient(ctx context.Context, config *rest.Config, clientset *kubernetes.Clientset, namespace string, podName string, podPort string) *redis.Client {
+	// Create custom dialer
+	k8sDialer := k8sdialer.NewK8sDialer(config, clientset, namespace, podName, podPort)
+
+	// Create Redis client with the custom dialer
+	redisClient := redis.NewClient(&redis.Options{
+		Addr:   "dummy_address_not_used:6379",
+		Dialer: k8sDialer.DialContext,
+	})
+
+	if err := redisClient.Ping(ctx).Err(); err != nil {
+		fmt.Println("fatal error: ", err)
+		os.Exit(1)
+	}
+
+	fmt.Printf("✅ connected to redis directly through K8s pod %s (no local port)\n", podName)
+
+	return redisClient
 }
